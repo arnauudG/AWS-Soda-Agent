@@ -1,0 +1,76 @@
+# Terraform files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+.terraform.lock.hcl
+
+# Terragrunt files
+.terragrunt-cache/
+terragrunt.hcl.bak
+
+# Generated files by Terragrunt (in env/ directories)
+env/**/provider.tf
+env/**/backend.tf
+env/**/versions_override.tf
+env/**/provider_override.tf
+env/**/main.tf
+
+# Backup files
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# IDE and editor files
+.cursor/
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables (if stored locally)
+.env
+.env.local
+*.env
+
+# Logs
+*.log
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+build/
+*.egg-info/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Package files (large binaries)
+packages/**/*.tar.gz
+packages/**/*.zip
+packages/**/*.tgz
+packages/**/*.tar

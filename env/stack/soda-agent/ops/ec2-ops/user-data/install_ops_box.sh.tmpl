@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euxo pipefail
+
+# --------- template vars (Terraform renders these) ---------
+REGION="${region}"
+
+# Always (re)enable & restart SSM even if something fails
+finish() {
+  systemctl enable --now amazon-ssm-agent || true
+  systemctl restart amazon-ssm-agent || true
+}
+trap finish EXIT
+
+# Base tools
+dnf -y install unzip curl git jq || true
+
+# AWS CLI v2 if missing (non-fatal)
+if ! command -v aws >/dev/null 2>&1; then
+  ( set +e
+    timeout 120 curl -fsSLo /tmp/awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip || exit 0
+    unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install || true
+  )
+fi
+
+# -------------------------
+# Install kubectl (stable)
+# -------------------------
+(
+  set +e
+  ARCH_DL=amd64
+  case "$(uname -m)" in
+    aarch64|arm64) ARCH_DL=arm64 ;;
+  esac
+
+  # global stable if we don't want to couple to the cluster version yet
+  RELEASE="$(timeout 30 curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null || true)"
+  if [ -n "$RELEASE" ]; then
+    timeout 120 curl -fsSLO "https://dl.k8s.io/release/$RELEASE/bin/linux/$ARCH_DL/kubectl" || exit 0
+    timeout 120 curl -fsSLO "https://dl.k8s.io/release/$RELEASE/bin/linux/$ARCH_DL/kubectl.sha256" || true
+
+    if [ -f kubectl.sha256 ]; then
+      echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - && install -m 0755 kubectl /usr/local/bin/kubectl || true
+    else
+      install -m 0755 kubectl /usr/local/bin/kubectl || true
+    fi
+    rm -f kubectl kubectl.sha256 || true
+    ln -sf /usr/local/bin/kubectl /usr/bin/kubectl || true
+  fi
+)
+
+# -------------------------
+# Install Helm (non-fatal)
+# -------------------------
+( set +e; timeout 120 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash ) || true
+
+# No kubeconfig here on purpose — do it later via SSM:
+#   aws eks update-kubeconfig --region "$REGION" --name <your-cluster>

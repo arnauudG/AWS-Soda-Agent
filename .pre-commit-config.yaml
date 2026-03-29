@@ -1,0 +1,159 @@
+# =============================================================================
+# Pre-commit hooks for Terraform / Terragrunt projects
+#
+# Goal:
+# - Catch syntax, formatting, and security issues as early as possible
+# - Enforce IaC hygiene without slowing developers down
+# - Shift governance and security left (before CI, before review)
+#
+# Install:
+#   pip install pre-commit
+#
+# Setup (once per repo):
+#   pre-commit install
+#
+# Run manually on all files:
+#   pre-commit run --all-files
+# =============================================================================
+
+repos:
+  # ---------------------------------------------------------------------------
+  # 1. General repository hygiene
+  #    These hooks are language-agnostic and prevent common Git footguns
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      # Remove trailing whitespace (except Terraform lock/state files)
+      - id: trailing-whitespace
+        exclude: '\.lock\.hcl$|\.tfstate$'
+
+      # Ensure files end with a newline
+      - id: end-of-file-fixer
+
+      # Validate YAML files (allow unsafe/custom tags)
+      - id: check-yaml
+        args: ['--unsafe']
+
+      # Validate JSON syntax
+      - id: check-json
+
+      # Prevent accidentally committing very large files (>1 MB)
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+
+      # Detect unresolved Git merge conflicts
+      - id: check-merge-conflict
+
+      # Prevent case-sensitive filename conflicts
+      - id: check-case-conflict
+
+      # Detect accidentally committed private keys
+      - id: detect-private-key
+
+      # Enforce consistent line endings (LF)
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # ---------------------------------------------------------------------------
+  # 2. Terraform: formatting, validation, linting, and static security checks
+  #    Fast, deterministic checks suitable for pre-commit
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.83.3
+    hooks:
+      # Enforce canonical Terraform formatting
+      # -diff + -write=false => fail if formatting is wrong, but do not auto-fix
+      - id: terraform_fmt
+        args:
+          - --args=-diff
+          - --args=-write=false
+
+      # Validate Terraform configuration (no provider calls)
+      - id: terraform_validate
+        args:
+          - --args=-no-color
+
+      # TFLint: best practices, deprecated syntax, structure and conventions
+      # Rules selected here focus on correctness, readability, and maintainability
+      - id: terraform_tflint
+        args:
+          - --args=--only=terraform_deprecated_interpolation
+          - --args=--only=terraform_deprecated_index
+          - --args=--only=terraform_unused_declarations
+          - --args=--only=terraform_comment_syntax
+          - --args=--only=terraform_documented_outputs
+          - --args=--only=terraform_documented_variables
+          - --args=--only=terraform_typed_variables
+          - --args=--only=terraform_module_pinned_source
+          - --args=--only=terraform_naming_convention
+          - --args=--only=terraform_required_version
+          - --args=--only=terraform_required_providers
+          - --args=--only=terraform_standard_module_structure
+          - --args=--only=terraform_workspace_remote
+
+      # tfsec: fast static security analysis
+      # Only fail on HIGH and CRITICAL findings to avoid noise
+      - id: terraform_tfsec
+        args:
+          - --args=--minimum-severity=HIGH
+
+      # Checkov: broader security/compliance scanning
+      # Keep this practical: run Terraform checks with compact output.
+      # Prefer explicit suppressions in code for accepted exceptions.
+      - id: terraform_checkov
+        args:
+          - --args=--framework=terraform
+          - --args=--quiet
+          - --args=--compact
+
+  # ---------------------------------------------------------------------------
+  # 3. Terragrunt-specific validation and formatting
+  #    Keeps env/ structure clean and predictable
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/gruntwork-io/pre-commit
+    rev: v0.1.23
+    hooks:
+      # Validate Terragrunt configuration under env/
+      - id: terragrunt-validate
+        args: ['--terragrunt-working-dir', 'env']
+
+      # Enforce canonical Terragrunt HCL formatting
+      - id: terragrunt-hclfmt
+        args: ['--terragrunt-hclfmt-file', 'env']
+
+  # ---------------------------------------------------------------------------
+  # 4. Secret detection
+  #    Prevent credentials, tokens, and secrets from entering Git history
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        # No baseline by default to keep onboarding simple.
+        # If you want an allowlist/baseline workflow, generate one and re-enable:
+        #   detect-secrets scan > .secrets.baseline
+        #   args: ['--baseline', '.secrets.baseline']
+        args: []
+        exclude: package.lock.json
+
+  # ---------------------------------------------------------------------------
+  # 5. Shell script linting
+  #    Ensures shell scripts follow safe and portable practices
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.9.0.6
+    hooks:
+      - id: shellcheck
+        args: ['--severity=warning']
+        exclude: '\.tmpl$'
+
+  # ---------------------------------------------------------------------------
+  # 6. Markdown linting
+  #    Keeps documentation clean and consistent
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.38.0
+    hooks:
+      - id: markdownlint
+        args: ['--fix']
