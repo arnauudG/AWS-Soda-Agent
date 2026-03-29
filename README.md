@@ -162,7 +162,6 @@ git clone https://github.com/arnauudG/AWS-Soda-Agent.git
 cd AWS-Soda-Agent
 
 # 2. Export required variables
-export T
 export TF_VAR_environment=dev
 export TF_VAR_region=eu-west-1
 export AWS_PROFILE=my-profile
@@ -407,7 +406,6 @@ If `destroy --target all` fails while deleting bootstrap, typical causes are:
 
 The CLI now purges bucket versions and retries automatically, and treats the known lock-release race as successful if bucket + table are already gone.
 It also tolerates `terragrunt import` races where a resource is already managed in state.
-If Terraform backend checksum drift is detected (S3/DynamoDB digest mismatch), the CLI falls back to direct AWS deletion of the bootstrap bucket and lock table.
 
 ### Soda API Key 403 Error
 
