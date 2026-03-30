@@ -114,7 +114,7 @@ AWS-Soda-Agent/
 | **Terragrunt** | Terraform orchestration | Latest |
 | **AWS CLI** | AWS API access | v2.x |
 | **kubectl** | EKS cluster access | Latest |
-| **Helm** | Kubernetes package manager (optional, for debugging) | v3.x |
+| **Helm** | Required for `deploy --target full` add-on reconciliation | v3.x |
 
 ### AWS Account Setup
 
@@ -210,6 +210,7 @@ uv run --no-editable python -m aws_soda_agent.cli destroy --target all
 - New deployment (register a new agent): set `SODA_API_KEY_ID` + `SODA_API_KEY_SECRET`, leave `SODA_AGENT_ID` unset.
 - Redeploy/reattach existing agent: set the same API keys and set `SODA_AGENT_ID` to the existing agent UUID from Soda Cloud.
 - Optional registry overrides: `SODA_IMAGE_APIKEY_ID` and `SODA_IMAGE_APIKEY_SECRET` must be set together (or both unset).
+- Add-on deploy is reconciliation-based and idempotent: pre-existing namespace/secret resources are imported and stuck Helm pending states are reconciled before re-apply.
 
 ### Target Matrix
 
@@ -217,7 +218,7 @@ uv run --no-editable python -m aws_soda_agent.cli destroy --target all
 |---------|--------|--------------|-----------------|
 | `deploy` | `bootstrap` | Deploy/import only state backend (S3 + DynamoDB) | core env + `aws` + `terragrunt` + AWS auth |
 | `deploy` | `stack` | `bootstrap` + core infra modules | bootstrap checks + `terraform` |
-| `deploy` | `full` | `stack` + Soda Agent Helm add-on | stack checks + `SODA_API_KEY_ID` + `SODA_API_KEY_SECRET` |
+| `deploy` | `full` | `stack` + Soda Agent Helm add-on | stack checks + `helm` + `SODA_API_KEY_ID` + `SODA_API_KEY_SECRET` |
 | `destroy` | `addon` | Destroy only Soda Agent add-on | core env + `aws` + `terragrunt` + AWS auth |
 | `destroy` | `stack` | Destroy add-on + infra, keep bootstrap | destroy checks + interactive confirmation |
 | `destroy` | `all` | Destroy add-on + infra + bootstrap | stack checks + confirmation + bootstrap confirmation |
@@ -406,6 +407,26 @@ If `destroy --target all` fails while deleting bootstrap, typical causes are:
 
 The CLI now purges bucket versions and retries automatically, and treats the known lock-release race as successful if bucket + table are already gone.
 It also tolerates `terragrunt import` races where a resource is already managed in state.
+
+### Add-on Deploy Fails (`already exists` / Helm operation in progress)
+
+If `deploy --target full` is retried after partial/manual operations, common issues are:
+- `kubernetes_namespace.this[0]`: namespace already exists
+- `kubernetes_secret.image_pull[0]`: pull secret already exists
+- `helm_release.soda_agent`: another operation (install/upgrade/rollback) is in progress
+
+The CLI now reconciles these automatically:
+- imports existing namespace and image pull secret into Terraform state
+- refreshes kubeconfig from EKS before Helm reconciliation
+- resolves pending Helm states with rollback (to latest stable revision) or uninstall fallback, then retries apply
+
+If reconciliation still fails, inspect live state directly:
+```bash
+aws eks update-kubeconfig --name "${TF_VAR_org:-soda}-${TF_VAR_environment}-soda-agent-eks" --region "$TF_VAR_region"
+helm -n soda-agent status soda-agent
+helm -n soda-agent history soda-agent
+kubectl get all -n soda-agent
+```
 
 ### Soda API Key 403 Error
 

@@ -54,6 +54,8 @@ export SODA_AGENT_ID=<existing-agent-uuid>
 uv run --no-editable python -m aws_soda_agent.cli deploy --target full
 ```
 
+The add-on path is reconciliation-based and idempotent: if namespace, pull-secret, or Helm release state drift exists, the CLI imports/reconciles those resources and retries automatically.
+
 ## Destroy
 
 ```bash
@@ -84,6 +86,13 @@ export TF_VAR_environment=dev TF_VAR_region=eu-west-1
 aws eks update-kubeconfig --name "${TF_VAR_org:-soda}-${TF_VAR_environment}-soda-agent-eks" --region "$TF_VAR_region"
 kubectl get pods -n soda-agent
 kubectl logs -n soda-agent <pod> --previous --tail=100
+```
+
+Helm pending-operation recovery:
+
+```bash
+helm -n soda-agent status soda-agent
+helm -n soda-agent history soda-agent
 ```
 
 ## Production Readiness
