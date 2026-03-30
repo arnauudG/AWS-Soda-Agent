@@ -1,6 +1,6 @@
 [project]
 name = "aws-soda-agent"
-version = "0.1.6"
+version = "0.1.11"
 description = "UV CLI for AWS Soda Agent deploy/destroy orchestration."
 readme = "README.md"
 requires-python = ">=3.11"

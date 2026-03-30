@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -170,6 +171,8 @@ def _validate_deploy_target(target: DeployTarget) -> Context:
     _require_command("terragrunt")
     if target in {"stack", "full"}:
         _require_command("terraform")
+    if target == "full":
+        _require_command("helm")
 
     if target == "full":
         api_key_id = os.environ.get("SODA_API_KEY_ID", "").strip()
@@ -394,49 +397,260 @@ def _terragrunt_output_exists(module_path: str) -> bool:
     return bool(decoded)
 
 
+def _ensure_addon_kubeconfig() -> None:
+    environment, region, org = _require_core_env()
+    cluster_name = f"{org}-{environment}-{STACK}-eks"
+    result = run(
+        [
+            "aws",
+            "eks",
+            "update-kubeconfig",
+            "--name",
+            cluster_name,
+            "--region",
+            region,
+        ],
+        check=False,
+    )
+    _print_result_output(result)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Unable to configure kubeconfig for cluster {cluster_name!r} in {region!r}."
+        )
+
+
+def _reconcile_helm_release_pending_state(namespace: str, release_name: str) -> bool:
+    """Best-effort unlock of a Helm release stuck in pending-* status."""
+    try:
+        _ensure_addon_kubeconfig()
+    except RuntimeError as exc:
+        warn(str(exc))
+        return False
+
+    status_result = run(
+        ["helm", "status", release_name, "-n", namespace, "-o", "json"],
+        check=False,
+    )
+    status_combined = f"{status_result.stdout}\n{status_result.stderr}"
+    if status_result.returncode != 0:
+        if "not found" in status_combined.lower():
+            return True
+        warn(
+            f"Unable to read Helm release status for {namespace}/{release_name}; "
+            "attempting uninstall fallback."
+        )
+        uninstall = run(
+            [
+                "helm",
+                "uninstall",
+                release_name,
+                "-n",
+                namespace,
+                "--wait",
+                "--timeout",
+                "10m",
+            ],
+            check=False,
+        )
+        _print_result_output(uninstall)
+        uninstall_combined = f"{uninstall.stdout}\n{uninstall.stderr}".lower()
+        return uninstall.returncode == 0 or "not found" in uninstall_combined
+
+    try:
+        status_payload = json.loads(status_result.stdout or "{}")
+    except json.JSONDecodeError:
+        warn(f"Unable to parse Helm status for {namespace}/{release_name}.")
+        return False
+
+    current_status = str(status_payload.get("info", {}).get("status", "")).lower()
+    if not current_status.startswith("pending-"):
+        return True
+
+    warn(
+        f"Helm release {namespace}/{release_name} is {current_status}; "
+        "attempting reconciliation."
+    )
+    history_result = run(
+        ["helm", "history", release_name, "-n", namespace, "-o", "json"],
+        check=False,
+    )
+    _print_result_output(history_result)
+    stable_revision: int | None = None
+    if history_result.returncode == 0:
+        try:
+            history_payload = json.loads(history_result.stdout or "[]")
+            for row in reversed(history_payload):
+                row_status = str(row.get("status", "")).lower()
+                if row_status in {"deployed", "superseded"}:
+                    stable_revision = int(row["revision"])
+                    break
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            stable_revision = None
+
+    if stable_revision is not None:
+        warn(
+            f"Rolling back Helm release {namespace}/{release_name} "
+            f"to revision {stable_revision}."
+        )
+        rollback = run(
+            [
+                "helm",
+                "rollback",
+                release_name,
+                str(stable_revision),
+                "-n",
+                namespace,
+                "--wait",
+                "--timeout",
+                "10m",
+            ],
+            check=False,
+        )
+        _print_result_output(rollback)
+        if rollback.returncode == 0:
+            return True
+
+    warn(
+        f"No stable Helm revision available for {namespace}/{release_name}; "
+        "uninstalling pending release before retry."
+    )
+    uninstall = run(
+        [
+            "helm",
+            "uninstall",
+            release_name,
+            "-n",
+            namespace,
+            "--wait",
+            "--timeout",
+            "10m",
+        ],
+        check=False,
+    )
+    _print_result_output(uninstall)
+    uninstall_combined = f"{uninstall.stdout}\n{uninstall.stderr}".lower()
+    return uninstall.returncode == 0 or "not found" in uninstall_combined
+
+
 def _terragrunt_apply(module_path: str, module_name: str) -> None:
     module_dir = _module_dir(module_path)
     if not module_dir.is_dir():
         raise RuntimeError(f"Module directory not found: {module_dir}")
 
     info(f"Deploying {module_name}...")
-    apply_result = run(
-        ["terragrunt", "apply", "--auto-approve"],
-        cwd=module_dir,
-        check=False,
-        env=NON_INTERACTIVE_ENV,
-    )
-    _print_result_output(apply_result)
-    if apply_result.returncode == 0:
-        ok(f"{module_name} deployed.")
-        return
+    max_attempts = 6 if module_path == ADDON_MODULE[0] else 2
+    for attempt in range(1, max_attempts + 1):
+        apply_result = run(
+            ["terragrunt", "apply", "--auto-approve"],
+            cwd=module_dir,
+            check=False,
+            env=NON_INTERACTIVE_ENV,
+        )
+        _print_result_output(apply_result)
+        if apply_result.returncode == 0:
+            ok(f"{module_name} deployed.")
+            return
 
-    combined = f"{apply_result.stdout}\n{apply_result.stderr}"
-    retryable = (
-        "Required plugins are not installed" in combined
-        or "terraform init" in combined
-    )
-    if not retryable:
+        combined = f"{apply_result.stdout}\n{apply_result.stderr}"
+        retryable_init = (
+            "Required plugins are not installed" in combined
+            or "terraform init" in combined
+        )
+        if retryable_init:
+            warn(
+                f"{module_name}: provider init required "
+                f"(attempt {attempt}/{max_attempts}), re-initializing."
+            )
+            init_result = run(
+                ["terragrunt", "init", "-upgrade"],
+                cwd=module_dir,
+                check=False,
+                env=NON_INTERACTIVE_ENV,
+            )
+            _print_result_output(init_result)
+            continue
+
+        if module_path == ADDON_MODULE[0]:
+            ns_match = re.search(
+                r'namespace(?:s)?\s+"([^"]+)"\s+already exists',
+                combined,
+                flags=re.IGNORECASE,
+            )
+            if ns_match and "kubernetes_namespace.this[0]" in combined:
+                namespace_name = ns_match.group(1)
+                warn(
+                    f"{module_name}: importing existing namespace {namespace_name!r} "
+                    f"(attempt {attempt}/{max_attempts})."
+                )
+                ns_import = run(
+                    ["terragrunt", "import", "kubernetes_namespace.this[0]", namespace_name],
+                    cwd=module_dir,
+                    check=False,
+                    env=NON_INTERACTIVE_ENV,
+                )
+                _print_result_output(ns_import)
+                ns_import_combined = f"{ns_import.stdout}\n{ns_import.stderr}"
+                if ns_import.returncode != 0 and "Resource already managed by Terraform" not in ns_import_combined:
+                    raise CommandError(
+                        f"Failed to import namespace {namespace_name!r} for {module_name}."
+                    )
+                continue
+
+            secret_match = re.search(
+                r'secrets?\s+"([^"]+)"\s+already exists',
+                combined,
+                flags=re.IGNORECASE,
+            )
+            if secret_match and "kubernetes_secret.image_pull[0]" in combined:
+                secret_name = secret_match.group(1)
+                secret_namespace = "soda-agent"
+                warn(
+                    f"{module_name}: importing existing image pull secret "
+                    f"{secret_namespace!r}/{secret_name!r} (attempt {attempt}/{max_attempts})."
+                )
+                secret_import = run(
+                    [
+                        "terragrunt",
+                        "import",
+                        "kubernetes_secret.image_pull[0]",
+                        f"{secret_namespace}/{secret_name}",
+                    ],
+                    cwd=module_dir,
+                    check=False,
+                    env=NON_INTERACTIVE_ENV,
+                )
+                _print_result_output(secret_import)
+                secret_import_combined = f"{secret_import.stdout}\n{secret_import.stderr}"
+                if (
+                    secret_import.returncode != 0
+                    and "Resource already managed by Terraform" not in secret_import_combined
+                ):
+                    raise CommandError(
+                        f"Failed to import image pull secret "
+                        f"{secret_namespace!r}/{secret_name!r} for {module_name}."
+                    )
+                continue
+
+            if "another operation (install/upgrade/rollback) is in progress" in combined:
+                sleep_seconds = min(15 * attempt, 90)
+                warn(f"{module_name}: Helm release operation in progress (attempt {attempt}/{max_attempts}).")
+                recovered = _reconcile_helm_release_pending_state(
+                    namespace="soda-agent",
+                    release_name="soda-agent",
+                )
+                if not recovered:
+                    warn(
+                        f"{module_name}: Helm reconciliation did not complete; "
+                        f"waiting {sleep_seconds}s before retry."
+                    )
+                    time.sleep(sleep_seconds)
+                continue
+
         raise CommandError(f"Failed to deploy {module_name}.")
 
-    warn(f"{module_name}: provider init required, retrying with terragrunt init -upgrade.")
-    init_result = run(
-        ["terragrunt", "init", "-upgrade"],
-        cwd=module_dir,
-        check=False,
-        env=NON_INTERACTIVE_ENV,
+    raise CommandError(
+        f"Failed to deploy {module_name} after {max_attempts} reconciliation attempts."
     )
-    _print_result_output(init_result)
-    retry_result = run(
-        ["terragrunt", "apply", "--auto-approve"],
-        cwd=module_dir,
-        check=False,
-        env=NON_INTERACTIVE_ENV,
-    )
-    _print_result_output(retry_result)
-    if retry_result.returncode != 0:
-        raise CommandError(f"Failed to deploy {module_name} after init retry.")
-    ok(f"{module_name} deployed.")
 
 
 def _terragrunt_destroy(module_path: str, module_name: str) -> None:
