@@ -1,461 +1,408 @@
 # AWS Soda Agent
 
-Infrastructure as Code (IaC) package for deploying **Soda Agent** on AWS using Terraform and Terragrunt. Soda Agent runs containerized on Amazon EKS, connecting to [Soda Cloud](https://cloud.soda.io) for centralized data quality monitoring.
+Infrastructure as Code package for deploying **Soda Agent** on AWS EKS using Terraform + Terragrunt, orchestrated by a Python CLI.
 
-## Table of Contents
+## Purpose
 
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Package Contents](#package-contents)
-- [Prerequisites](#prerequisites)
-- [Environment Variables](#environment-variables)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Components](#components)
-- [Design Decisions](#design-decisions)
-- [Troubleshooting](#troubleshooting)
-- [Security Notes](#security-notes)
-- [Contributing](#contributing)
-- [Additional Documentation](#additional-documentation)
+Deploy a complete, self-contained Soda Agent environment in AWS through a single CLI command. The agent runs containerized on EKS and connects outbound to Soda Cloud for centralized data quality monitoring.
 
-## Overview
+## Business context
 
-This package deploys a complete, self-contained Soda Agent stack on AWS:
+Data engineering teams need a managed Soda Agent that connects to Soda Cloud to execute data quality checks against their data sources. This package provides deterministic deploy/destroy flows, cost-optimized dev defaults (SPOT instances, single NAT), and an ops instance for day-2 debugging.
 
-- **Amazon EKS** cluster with managed node groups (SPOT instances)
-- **VPC** with public/private subnets across 3 AZs
-- **VPC Endpoints** for private AWS service access (ECR, S3, SSM, STS, CloudWatch)
-- **Ops EC2 instance** for debugging (SSM Session Manager, no SSH)
-- **Soda Agent Helm chart** deployed into EKS
+## Scope
 
-All resource names follow the pattern `${org}-${env}-soda-agent-<resource>`, where `org` is configurable via `TF_VAR_org` (default: `soda`).
+**In scope:** VPC networking with multi-AZ subnet layout, EKS cluster with managed SPOT node groups, Soda Agent Helm chart, VPC endpoints for private AWS service access, ops EC2 instance (SSM only), stack-scoped state backend.
+
+**Out of scope:** data source connectivity configuration, Soda Cloud account setup, multi-cluster federation, HTTPS ingress (agent is outbound-only), CI/CD pipeline.
 
 ## Architecture
 
-```
-                         Soda Cloud (EU/US)
-                              |
-                    ┌─────────┴─────────┐
-                    │   Soda Agent Pod  │
-                    │  (Helm on EKS)    │
-                    └─────────┬─────────┘
-                              │
-┌─────────────────────────────┴────────────────────────────────┐
-│  AWS Account                                                 │
-│                                                              │
-│  ┌─ VPC (10.x.0.0/16) ────────────────────────────────────┐  │
-│  │                                                        │  │
-│  │  ┌─ Private Subnets ──────────────────────────────┐    │  │
-│  │  │  EKS Managed Node Groups (t3.small, SPOT)      │    │  │
-│  │  │  Ops EC2 Instance (SSM access)                 │    │  │
-│  │  │  VPC Endpoints (ECR, S3, SSM, STS, CW Logs)    │    │  │
-│  │  └────────────────────────────────────────────────┘    │  │
-│  │                                                        │  │
-│  │  ┌─ Public Subnets ───────────────────────────────┐    │  │
-│  │  │  NAT Gateway(s)   Internet Gateway             │    │  │
-│  │  └────────────────────────────────────────────────┘    │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                                                              │
-│  S3 (tfstate) + DynamoDB (locks) — per-stack backend         │
-└──────────────────────────────────────────────────────────────┘
-```
+The stack deploys Soda Agent as a Helm chart on EKS in private subnets. The agent connects outbound to Soda Cloud via NAT gateway — there is no inbound internet traffic to the application. An ops EC2 instance in a public subnet provides administrative access via SSM Session Manager.
 
-## Package Contents
+See `soda-agent-architecture.drawio` and `soda-agent-architecture.svg` for the full diagram.
+
+### Network layout
+
+The VPC is carved into `/22` subnets (1024 IPs each) using `cidrsubnet(cidr, 6, index)`, distributed across 3 availability zones.
 
 ```
-AWS-Soda-Agent/
-├── pyproject.toml                    # uv project and CLI entrypoint
-├── src/aws_soda_agent/               # Python CLI package (deploy/destroy orchestration)
-├── .pre-commit-config.yaml           # Terraform fmt/validate/tflint/tfsec/checkov
+VPC 10.10.0.0/16 (dev) · 10.20.0.0/16 (prod)
+├── Public subnets (/22 per AZ)
+│   ├── AZ-a: 10.10.0.0/22   ← Ops EC2, NAT gateway
+│   ├── AZ-b: 10.10.4.0/22   ← NAT gateway (prod per-AZ)
+│   └── AZ-c: 10.10.8.0/22   ← NAT gateway (prod per-AZ)
 │
-├── env/                              # Terragrunt configuration
-│   ├── root.hcl                     # Global config: validations, remote state, shared inputs
-│   ├── env.hcl                      # Environment definitions (dev/prod)
-│   ├── common.hcl                   # Common provider/backend generation
-│   └── stack/
-│       ├── stack-globals.hcl        # Shared stack-level variable propagation
-│       └── soda-agent/              # Live infrastructure configs
-│           ├── root.hcl             # Stack-scoped remote state
-│           ├── bootstrap/           # S3 + DynamoDB for state backend
-│           ├── network/
-│           │   ├── vpc/             # VPC, subnets, routing, NAT
-│           │   └── vpc-endpoints/
-│           ├── ops/
-│           │   ├── sg-ops/          # Security groups for ops
-│           │   └── ec2-ops/         # Ops EC2 instance
-│           ├── eks/
-│           │   ├── terragrunt.hcl          # EKS cluster + node groups
-│           │   └── ops-ec2-eks-access/     # IAM/RBAC for ops → EKS
-│           └── addons/
-│               └── soda-agent/      # Helm chart deployment
-│
-└── module/                           # Reusable Terraform modules
-    ├── application/helm/soda-agent/  # Helm provider wrapper
-    ├── compute/
-    │   ├── ec2/ops/                  # Ops EC2 instance
-    │   └── eks/cluster/              # EKS cluster (wraps terraform-aws-modules/eks)
-    ├── network/
-    │   ├── vpc/                      # VPC (wraps terraform-aws-modules/vpc)
-    │   └── vpc-endpoints/            # VPC endpoints
-    └── security/
-        ├── iam/ops-eks-access/       # IAM for ops EC2 → EKS
-        └── security-group/ops/       # Security group module
+└── Private subnets (/22 per AZ)
+    ├── AZ-a: 10.10.12.0/22  ← EKS node group, VPC endpoints
+    ├── AZ-b: 10.10.16.0/22  ← EKS node group, VPC endpoints
+    └── AZ-c: 10.10.20.0/22  ← EKS node group, VPC endpoints
 ```
 
-## Prerequisites
+### Traffic flow
 
-### Required Tools
+Soda Agent pods run on EKS managed node groups in private subnets. Outbound traffic to Soda Cloud (`cloud.soda.io`) exits through NAT gateway(s) in the public subnets and the internet gateway. There is no inbound internet traffic — the agent initiates all connections to Soda Cloud.
 
-| Tool | Purpose | Minimum Version |
-|------|---------|----------------|
-| **uv** | Python runtime + CLI execution | Latest |
-| **Python** | Runtime for the CLI | >= 3.11 |
-| **Terraform** | Infrastructure provisioning | >= 1.5.0 |
-| **Terragrunt** | Terraform orchestration | Latest |
-| **AWS CLI** | AWS API access | v2.x |
-| **kubectl** | EKS cluster access | Latest |
-| **Helm** | Required for `deploy --target full` add-on reconciliation | v3.x |
+The ops EC2 instance in the AZ-a public subnet provides `kubectl` and `helm` access to the EKS cluster API on port 443. Access to the ops instance itself is exclusively through SSM Session Manager — no SSH keys, no public IP dependency.
 
-### AWS Account Setup
+### VPC endpoints
 
-Your AWS credentials need permissions to create: VPC, subnets, NAT gateways, EKS clusters, EC2 instances, security groups, IAM roles, S3 buckets, DynamoDB tables, and CloudWatch Logs.
+Eight VPC endpoints keep control-plane and container-registry traffic off the public internet:
 
-### Soda Cloud Setup
+- `ssm`, `ssmmessages`, `ec2messages` — Interface endpoints for SSM Session Manager
+- `ecr.api`, `ecr.dkr` — Interface endpoints for ECR container image pulls
+- `sts` — Interface endpoint for security token service
+- `logs` — Interface endpoint for CloudWatch Logs
+- `s3` — Gateway endpoint for ECR layer downloads and state access
 
-1. Log in to [Soda Cloud](https://cloud.soda.io)
-2. Go to **Data Sources > Agents > New Soda Agent**
-3. Copy the **API Key ID** and **API Key Secret** from the dialog
-4. Do **NOT** use keys from Profile > API Keys (those are human user keys and will 403)
+### NAT gateway topology
 
-## Environment Variables
+Dev uses a single NAT gateway (cost optimization). Prod uses one NAT gateway per AZ (resilience). Controlled by `vpc.single_nat_gateway` in `env/env.hcl`.
 
-All configuration is passed via environment variables. No configuration files are needed. This makes the package CI/CD-ready out of the box.
+### EKS cluster
 
-### Required (all commands)
+The EKS cluster runs Kubernetes 1.31 with managed node groups using SPOT instances (`t3.small`). Core add-ons (CoreDNS, kube-proxy, VPC CNI with prefix delegation) are managed by EKS. The cluster API endpoint is public in dev and private-only in prod.
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `TF_VAR_environment` | Target environment | `dev` or `prod` |
-| `TF_VAR_region` | AWS region | `eu-west-1`, `us-east-1`, `eu-central-1` |
-| `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | AWS credentials | - |
-| `SODA_API_KEY_ID` | Soda Cloud API key ID (required only for `deploy --target full`) | - |
-| `SODA_API_KEY_SECRET` | Soda Cloud API key secret (required only for `deploy --target full`) | - |
+The Soda Agent is deployed as a Helm chart into the `soda-agent` namespace. The agent pod connects to Soda Cloud for orchestration and job execution.
 
-### Optional
+### State backend
+
+A dedicated S3 bucket (versioned, encrypted) + DynamoDB lock table is bootstrapped per stack/environment as the first deployment step. Naming: `<account>-<org>-<env>-soda-agent-tfstate-<region>`.
+
+## Module execution order
+
+The CLI orchestrator (`aws_soda_agent.cli`) executes Terragrunt modules in deterministic order.
+
+### Deploy order
+
+| Step | Module path | Domain | bootstrap | stack | full |
+|------|-------------|--------|:---------:|:-----:|:----:|
+| 1 | `bootstrap` | State | ✓ | ✓ | ✓ |
+| 2 | `network/vpc` | Network | | ✓ | ✓ |
+| 3 | `network/vpc-endpoints` | Network | | ✓ | ✓ |
+| 4 | `ops/sg-ops` | Security | | ✓ | ✓ |
+| 5 | `eks` | Compute | | ✓ | ✓ |
+| 6 | `ops/ec2-ops` | Compute | | ✓ | ✓ |
+| 7 | `eks/ops-ec2-eks-access` | IAM | | ✓ | ✓ |
+| 8 | `addons/soda-agent` | App | | | ✓ |
+
+### Destroy order
+
+Reverse of deploy. `destroy --target addon` removes step 8. `destroy --target stack` removes 8–2. `destroy --target all` removes everything including bootstrap.
+
+## Configuration reference
+
+### Variables by deploy target
+
+| Variable | bootstrap | stack | full | Notes |
+|----------|:---------:|:-----:|:----:|-------|
+| `TF_VAR_environment` | ✓ | ✓ | ✓ | `dev` or `prod` |
+| `TF_VAR_region` | ✓ | ✓ | ✓ | `eu-west-1`, `us-east-1`, `eu-central-1` |
+| AWS credentials | ✓ | ✓ | ✓ | `AWS_PROFILE` or access key pair |
+| `SODA_API_KEY_ID` | | | ✓ | Service Account key from Soda Cloud |
+| `SODA_API_KEY_SECRET` | | | ✓ | Service Account secret from Soda Cloud |
+| `TF_VAR_org` | opt | opt | opt | Resource name prefix (default: `soda`) |
+
+Legend: ✓ = required, opt = optional override
+
+### Soda Agent variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TF_VAR_org` | `soda` | Organisation prefix for all resource names |
+| `SODA_AGENT_ID` | empty | Existing agent UUID for redeploy/reattach |
 | `SODA_CLOUD_REGION` | `eu` | Soda Cloud region (`eu` or `us`) |
 | `SODA_LOG_LEVEL` | `INFO` | Agent log level |
 | `SODA_LOG_FORMAT` | `raw` | Log format (`raw` or `json`) |
-| `SODA_AGENT_ID` | - | Existing agent UUID (set when redeploying to avoid name conflict) |
-| `SODA_IMAGE_APIKEY_ID` | `SODA_API_KEY_ID` | Separate registry credentials (only if provided by Soda) |
-| `SODA_IMAGE_APIKEY_SECRET` | `SODA_API_KEY_SECRET` | Separate registry credentials |
-| `TG_EXPECTED_ACCOUNT_ID` | - | Safety check: fail if authenticated to wrong AWS account |
+| `SODA_IMAGE_APIKEY_ID` | uses `SODA_API_KEY_ID` | Separate registry credentials (if provided by Soda) |
+| `SODA_IMAGE_APIKEY_SECRET` | uses `SODA_API_KEY_SECRET` | Separate registry credentials |
+| `TG_EXPECTED_ACCOUNT_ID` | empty | Safety check against wrong AWS account |
 
-## Quick Start
+### Environment-specific defaults (env/env.hcl)
+
+| Setting | Dev | Prod |
+|---------|-----|------|
+| VPC CIDR | 10.10.0.0/16 | 10.20.0.0/16 |
+| NAT gateway | Single | Per-AZ |
+| VPC flow logs | Disabled | Enabled |
+| EKS node group | 1–2 × t3.small SPOT | 2–5 × t3.small SPOT |
+| EKS public endpoint | Yes | No |
+| CW log retention | 7 days | 30 days |
+| Ops EC2 | t3.micro, 16 GB | t3.small, 20 GB |
+| Helm chart version | Latest | Pinned (1.3.15) |
+
+### Soda Cloud API keys
+
+Use **only** keys from the **New Soda Agent** dialog in Soda Cloud:
+
+1. Log in to [Soda Cloud](https://cloud.soda.io)
+2. Go to **Data Sources → Agents → New Soda Agent**
+3. Copy the **API Key ID** and **API Key Secret** from the dialog
+
+Do **not** use keys from Profile → API Keys — those are human user keys and cause `403 Invalid user type: HumanUser`.
+
+### Agent ID vs. registration
+
+Without `SODA_AGENT_ID`: the agent registers a new agent name in Soda Cloud. This works only if the name is not already taken. If it is, the pod enters CrashLoopBackOff with "agent with name X already registered."
+
+With `SODA_AGENT_ID`: the agent reuses an existing agent (no registration). Use this when redeploying after a destroy, or when the agent name is already taken. Find the ID in Soda Cloud: Agents → select agent → UUID in the URL.
+
+## Quick start
 
 ```bash
-# 1. Clone
-git clone https://github.com/arnauudG/AWS-Soda-Agent.git
+# 1. Clone and install
+git clone <repository-url>
 cd AWS-Soda-Agent
+uv sync
 
-# 2. Export required variables
+# 2. Set required variables
 export TF_VAR_environment=dev
 export TF_VAR_region=eu-west-1
 export AWS_PROFILE=my-profile
 export SODA_API_KEY_ID=<your-key-id>
 export SODA_API_KEY_SECRET=<your-key-secret>
 
-# 3. Sync local CLI environment
-uv sync
-
-# 4. Deploy
+# 3. Deploy full stack
 uv run --no-editable python -m aws_soda_agent.cli deploy --target full
 
-# 5. Verify
+# 4. Verify
 cd env/stack/soda-agent/eks
 terragrunt output cluster_endpoint
 ```
 
+`--no-editable` is recommended when project paths include spaces.
+
 ## Usage
 
-Everything goes through `uv run --no-editable python -m aws_soda_agent.cli`:
-
-`--no-editable` ensures reliable execution in workspaces with spaces in the path.
+### Command reference
 
 ```bash
-# Deploy full stack (bootstrap + infra + Soda Agent add-on)
+# Help
+uv run --no-editable python -m aws_soda_agent.cli --help
+
+# Full deploy (bootstrap + infra + Soda Agent Helm)
 uv run --no-editable python -m aws_soda_agent.cli deploy --target full
 
-# Deploy state backend only
-uv run --no-editable python -m aws_soda_agent.cli deploy --target bootstrap
-
-# Deploy bootstrap + infrastructure (no Soda Agent add-on)
+# Infrastructure only (no Helm add-on)
 uv run --no-editable python -m aws_soda_agent.cli deploy --target stack
 
-# Destroy only Soda Agent add-on
+# Bootstrap only
+uv run --no-editable python -m aws_soda_agent.cli deploy --target bootstrap
+
+# Destroy Soda Agent add-on only
 uv run --no-editable python -m aws_soda_agent.cli destroy --target addon
 
-# Destroy add-on + infrastructure (preserves bootstrap)
+# Destroy add-on + infra (keep bootstrap)
 uv run --no-editable python -m aws_soda_agent.cli destroy --target stack
 
-# Destroy add-on + infrastructure + bootstrap
+# Destroy everything including bootstrap
 uv run --no-editable python -m aws_soda_agent.cli destroy --target all
 ```
 
-### New Deploy vs Redeploy
+### Target matrix
 
-- New deployment (register a new agent): set `SODA_API_KEY_ID` + `SODA_API_KEY_SECRET`, leave `SODA_AGENT_ID` unset.
-- Redeploy/reattach existing agent: set the same API keys and set `SODA_AGENT_ID` to the existing agent UUID from Soda Cloud.
-- Optional registry overrides: `SODA_IMAGE_APIKEY_ID` and `SODA_IMAGE_APIKEY_SECRET` must be set together (or both unset).
-- Add-on deploy is reconciliation-based and idempotent: pre-existing namespace/secret resources are imported and stuck Helm pending states are reconciled before re-apply.
+| Command | Target | What it does |
+|---------|--------|--------------|
+| `deploy` | `bootstrap` | State backend only (S3 + DynamoDB) |
+| `deploy` | `stack` | Backend + VPC + endpoints + EKS + ops |
+| `deploy` | `full` | Stack + Soda Agent Helm chart |
+| `destroy` | `addon` | Soda Agent Helm chart only |
+| `destroy` | `stack` | Add-on + infra, preserve bootstrap |
+| `destroy` | `all` | Everything including bootstrap teardown |
 
-### Target Matrix
-
-| Command | Target | What it does | Required checks |
-|---------|--------|--------------|-----------------|
-| `deploy` | `bootstrap` | Deploy/import only state backend (S3 + DynamoDB) | core env + `aws` + `terragrunt` + AWS auth |
-| `deploy` | `stack` | `bootstrap` + core infra modules | bootstrap checks + `terraform` |
-| `deploy` | `full` | `stack` + Soda Agent Helm add-on | stack checks + `helm` + `SODA_API_KEY_ID` + `SODA_API_KEY_SECRET` |
-| `destroy` | `addon` | Destroy only Soda Agent add-on | core env + `aws` + `terragrunt` + AWS auth |
-| `destroy` | `stack` | Destroy add-on + infra, keep bootstrap | destroy checks + interactive confirmation |
-| `destroy` | `all` | Destroy add-on + infra + bootstrap | stack checks + confirmation + bootstrap confirmation |
-
-### CLI Reference
-
-- Show help: `uv run --no-editable python -m aws_soda_agent.cli --help`
-- Deploy default target: `full` (if `--target` is omitted)
-- Destroy default target: `stack` (if `--target` is omitted)
-- Non-interactive apply/destroy flags are set internally (`TF_INPUT=0`, `TG_INPUT=0`)
-- For unusual launch contexts, set `AWS_SODA_AGENT_ROOT` to your repo root before running commands
-
-### Operator Runbook
-
-Use these blocks as day-2 copy/paste commands.
-
-#### 1) New Deploy (new Soda Agent registration)
+### New deploy vs. redeploy
 
 ```bash
-export TF_VAR_environment=dev
-export TF_VAR_region=eu-west-1
-export AWS_PROFILE=my-profile
-export SODA_API_KEY_ID=<agent-key-id>
-export SODA_API_KEY_SECRET=<agent-key-secret>
+# New agent (first time)
 unset SODA_AGENT_ID
-
-uv sync
 uv run --no-editable python -m aws_soda_agent.cli deploy --target full
-```
 
-#### 2) Redeploy / Reattach Existing Agent
-
-```bash
-export TF_VAR_environment=dev
-export TF_VAR_region=eu-west-1
-export AWS_PROFILE=my-profile
-export SODA_API_KEY_ID=<agent-key-id>
-export SODA_API_KEY_SECRET=<agent-key-secret>
+# Redeploy existing agent
 export SODA_AGENT_ID=<existing-agent-uuid>
-
-uv sync
 uv run --no-editable python -m aws_soda_agent.cli deploy --target full
 ```
 
-#### 3) Partial Destroy (remove add-on only)
+## Prerequisites
 
-```bash
-export TF_VAR_environment=dev
-export TF_VAR_region=eu-west-1
-export AWS_PROFILE=my-profile
+| Tool | Purpose | Minimum version |
+|------|---------|-----------------|
+| `uv` | Python runtime + CLI | latest |
+| `python` | CLI runtime | >= 3.11 |
+| `terraform` | Infrastructure provisioning | >= 1.5.0 |
+| `terragrunt` | Orchestration and dependencies | latest |
+| `aws` CLI | AWS API access | v2.x |
+| `kubectl` | EKS cluster access | latest |
+| `helm` | Soda Agent Helm deployment | v3.x |
 
-uv run --no-editable python -m aws_soda_agent.cli destroy --target addon
+## Package contents
+
+```
+├── pyproject.toml                       # uv package + entrypoint
+├── src/aws_soda_agent/
+│   ├── cli.py                           # argparse interface
+│   ├── orchestrator.py                  # deploy/destroy orchestration
+│   └── shell.py                         # subprocess wrapper
+├── env/
+│   ├── root.hcl                         # global config, validations, remote state
+│   ├── env.hcl                          # environment catalog (dev/prod)
+│   ├── common.hcl                       # provider + backend generation
+│   └── stack/soda-agent/
+│       ├── root.hcl                     # stack-scoped remote state
+│       ├── bootstrap/                   # S3 + DynamoDB state backend
+│       ├── network/
+│       │   ├── vpc/                     # VPC + subnets + NAT
+│       │   └── vpc-endpoints/           # SSM, ECR, STS, CW, S3
+│       ├── ops/
+│       │   ├── sg-ops/                  # ops security group
+│       │   └── ec2-ops/                 # ops EC2 + user-data
+│       ├── eks/
+│       │   ├── (main)                   # EKS cluster + node groups
+│       │   └── ops-ec2-eks-access/      # IAM for ops → EKS
+│       └── addons/soda-agent/           # Helm chart deployment
+├── module/                              # reusable Terraform modules
+│   ├── application/helm/soda-agent/
+│   ├── compute/ec2/ops/
+│   ├── compute/eks/cluster/
+│   ├── network/vpc/
+│   ├── network/vpc-endpoints/
+│   ├── security/iam/ops-eks-access/
+│   └── security/security-group/ops/
+└── .pre-commit-config.yaml              # fmt/validate/tflint/tfsec/checkov
 ```
 
-#### 4) Full Teardown (add-on + stack + bootstrap)
+## Operational runbook
+
+### Preflight
 
 ```bash
-export TF_VAR_environment=dev
-export TF_VAR_region=eu-west-1
-export AWS_PROFILE=my-profile
-
-uv run --no-editable python -m aws_soda_agent.cli destroy --target all
+aws sts get-caller-identity
+uv run --no-editable python -m aws_soda_agent.cli --help
 ```
 
-### Individual Module
-
-For advanced use, you can apply individual modules directly:
+### Verify EKS and Soda Agent after deploy
 
 ```bash
-cd env/stack/soda-agent/network/vpc
-terragrunt apply
+# Configure kubectl
+aws eks update-kubeconfig \
+  --name "${TF_VAR_org:-soda}-${TF_VAR_environment}-soda-agent-eks" \
+  --region "$TF_VAR_region"
+
+# Check pods
+kubectl get pods -n soda-agent
+
+# Check agent logs
+kubectl logs -n soda-agent -l app.kubernetes.io/name=soda-agent --tail=50
+
+# Helm status
+helm -n soda-agent status soda-agent
 ```
 
-## Components
+### SSM access to ops instance
 
-### Bootstrap
+```bash
+INSTANCE_ID=$(cd env/stack/soda-agent/ops/ec2-ops && terragrunt output -raw instance_id)
+aws ssm start-session --target "$INSTANCE_ID"
+```
 
-Creates a per-stack S3 bucket and DynamoDB table for Terraform state. Import-aware: if resources exist but state is missing, they are imported automatically.
+### Helm pending operation recovery
 
-**Naming**: `${ACCOUNT_ID}-${org}-${env}-soda-agent-tfstate-${region}` / `...-tf-locks`
+If the Helm release is stuck in `pending-install` or `pending-upgrade`:
 
-### VPC & Networking
+```bash
+helm -n soda-agent history soda-agent
+helm -n soda-agent rollback soda-agent <last-stable-revision>
+```
 
-| Setting | Dev | Prod |
-|---------|-----|------|
-| CIDR | 10.10.0.0/16 | 10.20.0.0/16 |
-| NAT Gateway | Single (cost-optimized) | Per-AZ (HA) |
-| Flow Logs | Disabled | Enabled |
-
-### EKS Cluster
-
-| Setting | Dev | Prod |
-|---------|-----|------|
-| Node instances | t3.small (1-2) | t3.small (2-5) |
-| Capacity | SPOT | SPOT |
-| Kubernetes | v1.31 | v1.31 |
-| Public endpoint | Yes | No |
-| Log retention | 7 days | 30 days |
-
-### Soda Agent Helm Chart
-
-| Setting | Dev | Prod |
-|---------|-----|------|
-| Chart version | Latest | Pinned (1.3.15) |
-| Namespace | soda-agent | soda-agent |
-| Cloud endpoint | EU (`cloud.soda.io`) | EU (`cloud.soda.io`) |
-
-### Ops EC2 Instance
-
-Small instance (`t3.micro` dev / `t3.small` prod) accessible only via AWS SSM Session Manager. Used for debugging EKS and running kubectl.
-
-## Design Decisions
-
-### Independent Stack Architecture
-
-The Soda Agent stack is fully self-contained with its own VPC, state backend, and networking. This eliminates cross-stack dependencies and simplifies deployment/destruction.
-
-### Terragrunt Orchestration
-
-Shared config in `env/root.hcl` + `env/env.hcl` provides DRY environment definitions. Dependencies between modules are declared explicitly. Remote state is configured automatically per module.
-
-### Single Entry Point
-
-One `uv` CLI (`uv run --no-editable python -m aws_soda_agent.cli`) provides deploy and destroy workflows with target-based scope control. All configuration is injected via environment variables — no config files to manage or commit. Directly compatible with CI/CD pipelines where secrets are injected at runtime.
-
-### Configurable Organisation Prefix
-
-All resource names use `${org}-${env}-soda-agent-<resource>`. The `org` prefix defaults to `soda` but can be overridden with `TF_VAR_org` to avoid naming collisions when deploying in shared accounts.
-
-### Bootstrap Import-Aware Design
-
-Bootstrap automatically imports existing S3/DynamoDB resources if they exist but state is missing, enabling recovery from state loss.
-
-### Mock Outputs for Validation
-
-All Terragrunt dependencies include `mock_outputs` with `mock_outputs_allowed_terraform_commands = ["init", "plan", "validate"]`, allowing validation without deploying dependencies.
-
-### Naming Conventions
-
-- Resources: `${org}-${env}-soda-agent-<resource-type>` (e.g., `soda-dev-soda-agent-eks`)
-- VPC: `${org}-${env}-${region}-soda-agent-vpc`
-- State bucket: `${account}-${org}-${env}-soda-agent-tfstate-${region}`
-- Agent name: `${org}-${env}-agent`
+The CLI handles this automatically during `deploy --target full` with up to 6 reconciliation attempts.
 
 ## Troubleshooting
 
-### AWS Credentials Not Working
-
-1. Verify your environment variables are set: `env | grep -E 'AWS_|TF_VAR_'`
-2. If using access keys, ensure `AWS_PROFILE` is unset: `unset AWS_PROFILE`
-3. Test: `aws sts get-caller-identity`
-
 ### Soda Agent CrashLoopBackOff
 
-**Cause**: Agent name already registered in Soda Cloud from a previous deployment.
+Cause: agent name already registered in Soda Cloud from a previous deployment. Fix: set `SODA_AGENT_ID` to the existing agent UUID and redeploy.
 
-**Fix**: Set `SODA_AGENT_ID` to the existing agent's UUID (visible in Soda Cloud URL: Agents > agent > ID in URL), then redeploy.
+### Image pull errors
 
-### State Lock Error
+Verify API keys have access to `registry.cloud.soda.io`. Check pod events: `kubectl describe pod -n soda-agent <pod-name>`.
 
-```
-Error: Error acquiring the state lock
-```
+### Soda API Key 403
 
-Only unlock if you are sure no other process is using the state:
-```bash
-cd env/stack/soda-agent/<module>
-terragrunt force-unlock <lock-id>
-```
+You're using Profile API Keys (human user keys). Use Service Account keys from Data Sources → Agents → New Soda Agent.
 
-### Bootstrap Resources Exist But State Missing
+### State lock error
 
-The deploy handles this automatically via import. If it doesn't:
-```bash
-cd env/stack/soda-agent/bootstrap
-terragrunt import aws_s3_bucket.tfstate <bucket-name>
-terragrunt import aws_dynamodb_table.locks <table-name>
-terragrunt apply
-```
+Confirm no concurrent apply/destroy is running. Force unlock only if safe: `terragrunt force-unlock <lock-id>`.
 
-### Bootstrap Destroy Fails (`BucketNotEmpty` / lock release error)
+### Bootstrap destroy fails (BucketNotEmpty / lock release)
 
-If `destroy --target all` fails while deleting bootstrap, typical causes are:
-- The state bucket still has object versions/delete markers.
-- Terraform deleted the DynamoDB lock table before lock release completed.
+The CLI purges bucket versions and retries automatically. It also tolerates the known DynamoDB lock-release race condition when resources are already gone.
 
-The CLI now purges bucket versions and retries automatically, and treats the known lock-release race as successful if bucket + table are already gone.
-It also tolerates `terragrunt import` races where a resource is already managed in state.
+### Add-on deploy fails (already exists / Helm pending)
 
-### Add-on Deploy Fails (`already exists` / Helm operation in progress)
+The CLI auto-reconciles: imports existing namespace and image pull secret, resolves pending Helm states with rollback or uninstall fallback, then retries.
 
-If `deploy --target full` is retried after partial/manual operations, common issues are:
-- `kubernetes_namespace.this[0]`: namespace already exists
-- `kubernetes_secret.image_pull[0]`: pull secret already exists
-- `helm_release.soda_agent`: another operation (install/upgrade/rollback) is in progress
+## Architecture decision records
 
-The CLI now reconciles these automatically:
-- imports existing namespace and image pull secret into Terraform state
-- refreshes kubeconfig from EKS before Helm reconciliation
-- resolves pending Helm states with rollback (to latest stable revision) or uninstall fallback, then retries apply
+### ADR-001: CLI-first orchestration
 
-If reconciliation still fails, inspect live state directly:
-```bash
-aws eks update-kubeconfig --name "${TF_VAR_org:-soda}-${TF_VAR_environment}-soda-agent-eks" --region "$TF_VAR_region"
-helm -n soda-agent status soda-agent
-helm -n soda-agent history soda-agent
-kubectl get all -n soda-agent
-```
+A Python CLI centralizes deploy/destroy orchestration, bootstrap import recovery, Helm pending-state reconciliation, and environment validation. Direct Terragrunt remains possible for debugging.
 
-### Soda API Key 403 Error
+### ADR-002: Independent stack architecture
 
-You're using **Profile API Keys** (human user keys). You need **Service Account** keys from:
-**Data Sources > Agents > New Soda Agent** (copy from dialog).
+The Soda Agent stack is fully self-contained with its own VPC, state backend, and networking. No cross-stack dependencies.
 
-`deploy --target full` validates that the Soda Agent API keys are set before add-on deployment.
+### ADR-003: Environment-driven configuration
 
-## Security Notes
+All runtime config is injected via environment variables. No static config files to manage or commit. Environment catalog in `env/env.hcl` defines dev/prod defaults.
 
-1. **Terraform State Contains Secrets** — Even with `sensitive = true`, state files store plaintext. Protect your state backend.
-2. **Never Commit Secrets** — All secrets are passed via environment variables. Never hardcode them.
-3. **EKS nodes run in private subnets** — Outbound traffic goes through NAT gateway.
-4. **Ops access via SSM only** — No SSH keys, no public IPs on ops instances.
-5. **State backend is encrypted** — S3 AES256, public access blocked, TLS enforced, versioning enabled.
+### ADR-004: EKS with SPOT instances
+
+Managed node groups use SPOT capacity for cost optimization. Soda Agent workloads are stateless and tolerate interruption. SPOT savings are ~60-70% vs. on-demand.
+
+### ADR-005: Outbound-only networking
+
+No ALB, no inbound rules. The Soda Agent initiates all connections to Soda Cloud. This simplifies security: no ingress rules, no TLS certificate management, no domain configuration.
+
+### ADR-006: Ops EC2 in public subnet
+
+The ops instance is in a public subnet with a public IP for SSM reachability. No inbound security group rules — access is exclusively via SSM Session Manager. This avoids the cost of an SSM VPC endpoint for the ops instance while keeping the EKS nodes fully private.
+
+### ADR-007: Configurable organization prefix
+
+All resource names use `${org}-${env}-soda-agent-<resource>`. Override with `TF_VAR_org` to avoid naming collisions in shared accounts.
+
+### ADR-008: Bootstrap import-aware design
+
+Bootstrap automatically imports existing S3/DynamoDB resources if they exist but state is missing, enabling recovery from state loss or manual intervention.
+
+### ADR-009: Helm reconciliation on retry
+
+The add-on deploy handles pre-existing namespace/secret resources (via Terraform import) and stuck Helm releases (via rollback to last stable revision or uninstall fallback) automatically.
+
+## Security notes
+
+1. Terraform state contains secrets (even with `sensitive = true`) — protect backend access with IAM.
+2. Never commit Soda API keys or AWS credentials into repo files.
+3. EKS nodes run in private subnets — outbound traffic goes through NAT gateway only.
+4. Ops EC2 access via SSM only — no SSH keys, no inbound security group rules.
+5. S3 state backend is encrypted (AES256), versioned, public access blocked, TLS enforced.
+6. EKS cluster endpoint is private-only in prod (`cluster_endpoint_public_access = false`).
+7. IMDSv2 is enforced on all EC2 instances (`http_tokens = required`).
+8. Default VPC security group is locked down (no ingress, no egress).
+9. Set `TG_EXPECTED_ACCOUNT_ID` in CI/CD to prevent cross-account misfire.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branching strategy, commit conventions, and release checklist.
 
-## Additional Documentation
+## Additional documentation
 
 | Document | Description |
 |----------|-------------|
+| `soda-agent-architecture.drawio` | Architecture diagram (infrastructure topology) |
+| `soda-agent-architecture.svg` | SVG architecture diagram |
 | [env/README.md](env/README.md) | Terragrunt config hierarchy |
-| [env/stack/soda-agent/README.md](env/stack/soda-agent/README.md) | Soda Agent stack deployment guide |
-| Module READMEs | `module/**/README.md` — inputs, outputs, usage |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Branching, commits, release checklist |
-
-## License
-
-Proprietary. See repository or maintainers for license terms.
+| [env/stack/soda-agent/README.md](env/stack/soda-agent/README.md) | Stack deployment guide |
+| [module/application/helm/soda-agent/README.md](module/application/helm/soda-agent/README.md) | Helm chart module (inputs, API keys, troubleshooting) |
+| [module/compute/eks/cluster/README.md](module/compute/eks/cluster/README.md) | EKS cluster module |
+| [module/network/vpc/README.md](module/network/vpc/README.md) | VPC module |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Process and release guidance |
